@@ -1,4 +1,4 @@
-/* $OpenBSD: servconf.c,v 1.454 2026/09/16 00:16:52 djm Exp $ */
+/* $OpenBSD: servconf.c,v 1.457 2026/09/16 00:35:09 djm Exp $ */
 /*
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
  *                    All rights reserved
@@ -399,6 +399,8 @@ fill_default_server_options(ServerOptions *options)
 		options->pubkey_auth_options = 0;
 		options->max_pubkey_ok = DEFAULT_AUTH_FAIL_MAX;
 	}
+	if (options->agent_socket_path == NULL)
+		options->agent_socket_path = xstrdup(_PATH_SSH_AGENT_SOCKET_DIR);
 
 	assemble_algorithms(options);
 
@@ -430,6 +432,7 @@ fill_default_server_options(ServerOptions *options)
 	CLEAR_ON_NONE(options->routing_domain);
 	CLEAR_ON_NONE(options->host_key_agent);
 	CLEAR_ON_NONE(options->per_source_penalty_exempt);
+	CLEAR_ON_NONE(options->agent_socket_path);
 
 	for (i = 0; i < options->num_host_key_files; i++)
 		CLEAR_ON_NONE(options->host_key_files[i]);
@@ -1082,6 +1085,13 @@ static const struct multistate multistate_keepalives[] = {
 	{ "no",				SSH_KEEPALIVES_OFF },
 	{ "transport",			SSH_KEEPALIVES_TRANSPORT },
 	{ "all",			SSH_KEEPALIVES_ALL },
+};
+static const struct multistate multistate_warnweakcrypto[] = {
+	{ "true",			1 },
+	{ "false",			0 },
+	{ "yes",			1 },
+	{ "no",				0 },
+	{ "no-pq-kex",			0 },
 	{ NULL, -1 }
 };
 
@@ -1629,6 +1639,29 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 	case sAllowAgentForwarding:
 		intptr = &options->allow_agent_forwarding;
 		goto parse_flag;
+
+	case sAgentSocketPath:
+		charptr = &options->agent_socket_path;
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0')
+			fatal("%s line %d: missing path.", filename, linenum);
+		if (strncmp(arg, "shared:", 7) == 0) {
+			/* Shared paths must be absolute */
+			if (arg[7] != '/') {
+				fatal("%s line %d: invalid shared path.",
+				    filename, linenum);
+			}
+		} else if (strncmp(arg, "user:", 5) == 0) {
+			/* User paths must not be empty */
+			if (arg[5] == '\0') {
+				fatal("%s line %d: invalid user path.",
+				    filename, linenum);
+			}
+		} else if (strcmp(arg, "none") != 0)
+			fatal("%s line %d: invalid path.", filename, linenum);
+		if (*activep && *charptr == NULL)
+			*charptr = xstrdup(arg);
+		break;
 
 	case sDisableForwarding:
 		intptr = &options->disable_forwarding;
@@ -2531,6 +2564,11 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 	case sRefuseConnection:
 		intptr = &options->refuse_connection;
 		multistate_ptr = multistate_flag;
+		goto parse_multistate;
+
+	case sWarnWeakCrypto:
+		intptr = &options->warn_weak_crypto;
+		multistate_ptr = multistate_warnweakcrypto;
 		goto parse_multistate;
 
 	case sDeprecated:
@@ -3967,6 +4005,22 @@ copy_set_server_options(ServerOptions *dst, ServerOptions *src, int preauth)
 	assemble_algorithms(dst);
 
 	/*
+	 * These options may be "none" to clear a global setting.  They are
+	 * consulted before authentication, so they must be cleared here
+	 * rather than in the post-auth section below.
+	 */
+#define CLEAR_ON_NONE(v) \
+	do { \
+		if (option_clear_or_none(v)) { \
+			free(v); \
+			v = NULL; \
+		} \
+	} while(0)
+	CLEAR_ON_NONE(dst->authorized_principals_file);
+	CLEAR_ON_NONE(dst->trusted_user_ca_keys);
+	CLEAR_ON_NONE(dst->banner);
+
+	/*
 	 * The only things that should be below this point are string options
 	 * which are only used after authentication.
 	 */
@@ -3976,16 +4030,11 @@ copy_set_server_options(ServerOptions *dst, ServerOptions *src, int preauth)
 	/* These options may be "none" to clear a global setting */
 	copy_server_option_string(&dst->adm_forced_command,
 	    src->adm_forced_command);
-	if (option_clear_or_none(dst->adm_forced_command)) {
-		free(dst->adm_forced_command);
-		dst->adm_forced_command = NULL;
-	}
 	copy_server_option_string(&dst->chroot_directory,
 	    src->chroot_directory);
-	if (option_clear_or_none(dst->chroot_directory)) {
-		free(dst->chroot_directory);
-		dst->chroot_directory = NULL;
-	}
+	CLEAR_ON_NONE(dst->chroot_directory);
+	CLEAR_ON_NONE(dst->adm_forced_command);
+#undef CLEAR_ON_NONE
 
 	/* Subsystems require merging. */
 	servconf_merge_subsystems(dst, src);
@@ -4067,6 +4116,8 @@ fmt_intarg(ServerOpCodes code, int val)
 		return fmt_multistate_int(val, multistate_ignore_rhosts);
 	case sTCPKeepAlive:
 		return fmt_multistate_int(val, multistate_keepalives);
+	case sWarnWeakCrypto:
+		return fmt_multistate_int(val, multistate_warnweakcrypto);
 	case sFingerprintHash:
 		return ssh_digest_alg_name(val);
 	default:
@@ -4253,6 +4304,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sStreamLocalBindUnlink, o->fwd_opts.streamlocal_bind_unlink);
 	dump_cfg_fmtint(sFingerprintHash, o->fingerprint_hash);
 	dump_cfg_fmtint(sExposeAuthInfo, o->expose_userauth_info);
+	dump_cfg_fmtint(sWarnWeakCrypto, o->warn_weak_crypto);
 	dump_cfg_fmtint(sRefuseConnection, o->refuse_connection);
 
 	/* string arguments */
@@ -4284,6 +4336,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_string(sSshdSessionPath, o->sshd_session_path);
 	dump_cfg_string(sSshdAuthPath, o->sshd_auth_path);
 	dump_cfg_string(sPerSourcePenaltyExemptList, o->per_source_penalty_exempt);
+	dump_cfg_string(sAgentSocketPath, o->agent_socket_path);
 
 	/* string arguments requiring a lookup */
 	dump_cfg_string(sLogLevel, log_level_name(o->log_level));
